@@ -48,6 +48,7 @@ python linux_diagnose.py --source direct --host 10.0.5.20 --ssh-user diag_reader
 | 메모리 사용률 | 디스크 사용률(마운트별) |
 | 로그 오류 건수(Syslog) | OOM Killer(메모리 부족 프로세스 강제 종료) 발생 |
 | 보안 업데이트 누락 | VM/Arc 머신 연결·전원 상태, 크기, OS 버전(선택, ARM) |
+| OS 수명주기(EOL) 및 설치 패키지 EOL 탐지(direct 전용) | 권장 관리 도구(fail2ban/auditd/Azure Arc 등) 설치 여부(direct 전용) |
 
 ---
 
@@ -123,7 +124,22 @@ python linux_diagnose.py --source direct --host 10.0.5.20 --ssh-user diag_reader
 
 ---
 
-## ⚙️ 설치
+## ⚙️ Prerequisites
+
+**MCP 서버 / Azure SRE Agent로 사용할 때**
+- 별도 설치가 필요 없습니다 — 이 도구가 MCP 서버 컨테이너에 pip 패키지로 이미 설치돼 있고, 필요한 자격 증명(관리 ID 또는 `LINUX_DIAGNOSE_SSH_PASSWORD`)도 컨테이너에 구성돼 있습니다. SRE Agent에서 `diagnose_linux_os` 도구를 호출하기만 하면 됩니다.
+
+**단독 실행(Standalone)할 때**
+- Python 3.10+
+- direct 모드(SSH)를 쓰려면 대상 Linux 서버에 SSH로 접근 가능해야 합니다. azure-monitor 모드는 `az login`(로컬) 또는 관리 ID가 필요합니다.
+
+---
+
+## ⚙️ Installation & Execution
+
+**MCP 서버 / Azure SRE Agent로 사용할 때**는 설치가 필요 없습니다 — SRE Agent 포털에서 도구를 호출하면 MCP 서버가 내부적으로 실행합니다.
+
+**단독 실행(Standalone)할 때**:
 
 ```bash
 python -m venv .venv && source .venv/bin/activate     # Windows: .\.venv\Scripts\Activate.ps1
@@ -155,6 +171,13 @@ python linux_diagnose.py --source direct --host 10.0.5.20 --ssh-user diag_reader
 python linux_diagnose.py --source direct --host onprem-db01.corp.local --ssh-user diag_reader \
   --ssh-key-file ~/.ssh/diag_reader_id_ed25519 --ssh-known-hosts ~/.ssh/known_hosts
 
+# [direct] 비밀번호 인증 + known_hosts 검증 (Windows, 검증됨)
+# 1) 최초 1회는 직접 ssh로 접속해 지문(fingerprint)을 확인하고 yes로 known_hosts에 등록
+#    ssh admin@192.168.1.5
+# 2) 이후부터는 Windows OpenSSH의 known_hosts 경로를 --ssh-known-hosts로 지정하면 그대로 동작
+python linux_diagnose.py --source direct --host 192.168.1.5 --ssh-user admin `
+  --ssh-known-hosts $env:USERPROFILE\.ssh\known_hosts --format html -o linux.html
+
 # 임계값 조정 (두 방식 공통)
 python linux_diagnose.py --computer linux-app01 --workspace-id <guid> \
   --cpu-warn 75 --cpu-crit 90 --disk-used-warn 80 --disk-used-crit 90
@@ -168,6 +191,37 @@ python linux_diagnose.py --computer linux-app01 --workspace-id <guid> --format h
 # 데모 데이터로 미리보기 (Azure 호출 없음)
 python linux_diagnose.py --demo --format table
 ```
+
+---
+
+## 🧰 여러 서버 동시 진단 (멀티 호스트)
+
+**내장 배치(batch) 옵션은 없습니다** — `--host`/`--computer`는 한 번에 하나의 대상만 받습니다(이 제품군의 모든 도구가 동일한 설계 원칙). 여러 대 서버를 동시에 진단하려면 외부에서 루프를 돌리면 됩니다.
+
+```powershell
+# PowerShell 순차 실행
+$env:LINUX_DIAGNOSE_SSH_PASSWORD = "..."
+$hosts = "10.0.5.20", "10.0.5.21", "192.168.1.5"
+foreach ($h in $hosts) {
+  python linux_diagnose.py --source direct --host $h --ssh-user diag_reader `
+    --ssh-known-hosts $env:USERPROFILE\.ssh\known_hosts --format html -o "$h.html"
+}
+```
+
+```powershell
+# PowerShell 병렬 실행(ForEach-Object -Parallel, PowerShell 7+)
+$hosts | ForEach-Object -Parallel {
+  python linux_diagnose.py --source direct --host $_ --ssh-user diag_reader --format json -o "$_.json"
+} -ThrottleLimit 5
+```
+
+```bash
+# bash 병렬 실행(xargs)
+printf '%s\n' 10.0.5.20 10.0.5.21 192.168.1.5 | \
+  xargs -P 5 -I{} python linux_diagnose.py --source direct --host {} --ssh-user diag_reader --format json -o {}.json
+```
+
+여러 대를 병렬로 돌릴 때는 대상 서버 수에 비례해 동시 접속 부하가 늘어나므로(진단 자체는 가벼운 읽기 전용 명령이지만), 운영 환경에서는 `-ThrottleLimit`/`-P` 값을 적당히 제한하세요. 결과를 한눈에 보고 싶으면 각 호스트별 JSON 결과를 모아서 직접 집계/테이블화하거나, MCP/SRE Agent가 호스트 목록을 돌려가며 호출하도록 구성하는 방식을 권장합니다.
 
 ---
 
@@ -207,6 +261,9 @@ python linux_diagnose.py --source direct --host 10.0.5.20 --ssh-user diag_reader
 | `syslog` | err/crit/emerg/alert 건수 | ≥ `--log-err-warn`(기본 10건) | ≥ `--log-err-crit`(기본 50건) | 창 내 합계 |
 | `stability` | OOM Killer 발생 | — | 1건 이상 = critical | `Out of memory`/`oom-kill` 메시지 탐지 |
 | `patch` | 보안 업데이트 누락 건수 | 1건 이상 | 10건 이상 | `Update` 테이블(Update Management) |
+| `os_lifecycle` | 배포판 EOL 수명주기(direct 전용) | 종료까지 ≤ `--eol-warn-days`(기본 180일) | 이미 종료 | 임베디드 수명주기 표 대조 |
+| `software_eol` | 설치된 알려진 EOL 패키지(direct 전용) | 1건 이상 발견 | — | Python2/PHP/MySQL/OpenSSL 등 패턴 매칭 |
+| `recommended_software` | 권장 관리 도구 미설치(direct 전용) | — | — | 항상 info(문제로 간주하지 않음) |
 | `control_plane` | VM 전원 상태 | — | Deallocated/Stopped = critical | ARM instanceView(선택) |
 
 모든 항목은 데이터가 없으면 숨기지 않고 **"미평가"**로 표시됩니다(다른 도구와 동일한 리포트 완결성 철학).
@@ -276,3 +333,9 @@ Managed Identity에 다음 RBAC를 부여하면 됩니다(azure-monitor 모드 �
 - `--source azure-monitor`: `Syslog`/`Update` 수집은 데이터 수집 규칙(DCR)에 해당 시설(facility)/심각도가 포함돼 있어야 채워집니다. 배포판에 따라 syslog 데몬 설정(rsyslog/journald 포워딩)이 필요할 수 있습니다.
 - `--source direct`: 패치 점검은 apt/yum/dnf만 자동 감지합니다(다른 패키지 관리자는 미지원). `journalctl`이 없는 구버전 배포판은 `dmesg`/`/var/log/syslog` 폴백을 사용하므로 로그 보존 기간이 짧으면 일부 이벤트를 놓칠 수 있습니다.
 - 원격 명령 실행(Run Command 등)은 사용하지 않습니다 — azure-monitor 모드는 이미 수집된 원격 측정만 읽고, direct 모드도 읽기 전용 명령(`cat`/`df`/`journalctl` 등)만 실행합니다.
+
+---
+
+## 라이선스
+
+이 프로젝트는 [MIT License](LICENSE)를 따릅니다.
